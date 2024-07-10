@@ -3651,29 +3651,42 @@ impl Parser<'_> {
                     alt((
                         preceded(
                             (
-                                Self::parse_identifier.verify(|ident| {
-                                    ident.real_value() == "proctime" || ident.real_value() == "now"
-                                }),
+                                Self::parse_identifier
+                                    .verify(|ident| ident.real_value() == "current"),
                                 cut_err(Token::LParen),
                                 cut_err(Token::RParen),
                                 Token::Minus,
                             ),
-                            Self::parse_literal_interval.map(|e| match e {
+                            Self::parse_literal_interval.try_map(|e| match e {
                                 Expr::Value(v) => match v {
                                     Value::Interval {
                                         value,
                                         leading_field,
                                         ..
-                                    } => AsOf::ProcessTimeWithInterval((value, leading_field)),
+                                    } => {
+                                        if leading_field.is_none() {
+                                            return Err(StrError("expect leading_field".into()));
+                                        }
+                                        Ok(AsOf::ProcessTimeWithInterval((value, leading_field)))
+                                    }
                                     _ => {
-                                        unreachable!("expect Value::Interval")
+                                        return Err(StrError("expect Value::Interval".into()));
                                     }
                                 },
                                 _ => {
-                                    unreachable!("expect Expr::Value")
+                                    return Err(StrError("expect Expr::Value".into()));
                                 }
                             }),
                         ),
+                        (
+                            Self::parse_identifier.verify(|ident| ident.real_value() == "current"),
+                            cut_err(Token::LParen),
+                            cut_err(Token::RParen),
+                        )
+                            .value(AsOf::ProcessTimeWithInterval((
+                                "0".to_owned(),
+                                Some(DateTimeField::Second),
+                            ))),
                         (
                             Self::parse_identifier.verify(|ident| {
                                 ident.real_value() == "proctime" || ident.real_value() == "now"
