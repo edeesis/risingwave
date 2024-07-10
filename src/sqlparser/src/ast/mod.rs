@@ -3153,6 +3153,7 @@ impl fmt::Display for SetVariableValueSingle {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum AsOf {
     ProcessTime,
+    // used by time travel
     ProcessTimeWithInterval((String, Option<DateTimeField>)),
     // the number of seconds that have elapsed since the Unix epoch, which is January 1, 1970 at 00:00:00 Coordinated Universal Time (UTC).
     TimestampNum(i64),

@@ -304,14 +304,6 @@ impl PlanRoot {
             }
         };
 
-        if TemporalJoinValidator::exist_dangling_temporal_scan(plan.clone()) {
-            return Err(ErrorCode::NotSupported(
-                "do not support temporal join for batch queries".to_string(),
-                "please use temporal join in streaming queries".to_string(),
-            )
-            .into());
-        }
-
         let ctx = plan.ctx();
         // Inline session timezone mainly for rewriting now()
         plan = inline_session_timezone_in_exprs(ctx.clone(), plan)?;
