@@ -1,4 +1,4 @@
 [meta]
 enable_hummock_time_travel = true
-hummock_time_travel_retention_ms = 86400000
-hummock_time_travel_snapshot_interval = 100
+hummock_time_travel_retention_ms = 300000
+hummock_time_travel_snapshot_interval = 30
