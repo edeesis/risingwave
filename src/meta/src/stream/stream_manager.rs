@@ -20,6 +20,7 @@ use itertools::Itertools;
 use risingwave_common::catalog::TableId;
 use risingwave_meta_model_v2::ObjectId;
 use risingwave_pb::catalog::{CreateType, Subscription, Table};
+use risingwave_pb::meta::PausedReason;
 use risingwave_pb::stream_plan::update_mutation::MergeUpdate;
 use risingwave_pb::stream_plan::Dispatcher;
 use thiserror_ext::AsReport;
@@ -480,7 +481,7 @@ impl GlobalStreamManager {
         if let Err(err) = if need_pause {
             // we need to pause the barrier scheduler for sink into table
             self.barrier_scheduler
-                .run_config_change_command_with_pause(command)
+                .run_command_with_pause_reason(command, PausedReason::ReplaceTable)
                 .await
         } else {
             self.barrier_scheduler.run_command(command).await
