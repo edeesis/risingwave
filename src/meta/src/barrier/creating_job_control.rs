@@ -58,8 +58,8 @@ pub(super) enum CreatingStreamingJobStatus {
         graph_info: InflightGraphInfo,
         start_consume_log_store_epoch: u64,
     },
-    ConsumingUpstream(u64), // The prev epoch that starts consuming upstream
-    Finishing(u64),         // The prev epoch that will finish at
+    ConsumingUpstream(InflightGraphInfo), // The prev epoch that starts consuming upstream
+    Finishing(u64),                       // The prev epoch that will finish at
 }
 
 #[derive(Debug)]
@@ -319,7 +319,7 @@ impl CreatingStreamingJobControl {
         &mut self,
         control_stream_manager: &mut ControlStreamManager,
         command_ctx: &Arc<CommandContext>,
-    ) -> MetaResult<()> {
+    ) -> MetaResult<Option<InflightGraphInfo>> {
         let table_id = self.info.table_fragments.table_id();
         let start_consume_upstream = if let Command::MergeSnapshotBackfillStreamingJobs(
             jobs_to_merge,
@@ -329,7 +329,7 @@ impl CreatingStreamingJobControl {
         } else {
             false
         };
-        match &mut self.status {
+        let graph_to_finish = match &mut self.status {
             CreatingStreamingJobStatus::ConsumingSnapshot {
                 pending_commands, ..
             } => {
@@ -338,6 +338,7 @@ impl CreatingStreamingJobControl {
                     "should not start consuming upstream for a job that are consuming snapshot"
                 );
                 pending_commands.push(command_ctx.clone());
+                None
             }
             CreatingStreamingJobStatus::ConsumingLogStore { graph_info, .. } => {
                 let node_to_collect = control_stream_manager.inject_barrier(
@@ -351,27 +352,55 @@ impl CreatingStreamingJobControl {
                     (&command_ctx.curr_epoch, &command_ctx.prev_epoch),
                     &command_ctx.kind,
                     graph_info,
-                    if start_consume_upstream {
-                        // will merge to stream graph, and therefore the partial graph info will be None
+                    Some(graph_info),
+                    HashMap::new(),
+                )?;
+                if start_consume_upstream {
+                    let graph_info = take(graph_info);
+                    self.status = CreatingStreamingJobStatus::ConsumingUpstream(graph_info);
+                }
+                self.enqueue_epoch(command_ctx.prev_epoch.value().0, node_to_collect);
+                None
+            }
+            CreatingStreamingJobStatus::ConsumingUpstream(graph_info) => {
+                assert!(
+                    !start_consume_upstream,
+                    "should not start consuming upstream for a job again"
+                );
+                let should_finish = command_ctx.kind.is_checkpoint();
+                let node_to_collect = control_stream_manager.inject_barrier(
+                    Some(table_id),
+                    command_ctx.to_mutation(),
+                    (&command_ctx.curr_epoch, &command_ctx.prev_epoch),
+                    &command_ctx.kind,
+                    graph_info,
+                    if should_finish {
                         None
                     } else {
                         Some(graph_info)
                     },
                     HashMap::new(),
                 )?;
+                let graph_info = if should_finish {
+                    let graph_info = take(graph_info);
+                    self.status =
+                        CreatingStreamingJobStatus::Finishing(command_ctx.prev_epoch.value().0);
+                    Some(graph_info)
+                } else {
+                    None
+                };
                 self.enqueue_epoch(command_ctx.prev_epoch.value().0, node_to_collect);
-                if start_consume_upstream {
-                    self.status = CreatingStreamingJobStatus::ConsumingUpstream(
-                        command_ctx.prev_epoch.value().0,
-                    );
-                }
+                graph_info
             }
-            CreatingStreamingJobStatus::ConsumingUpstream(_)
-            | CreatingStreamingJobStatus::Finishing(_) => {
-                assert!(!start_consume_upstream, "should not finish a job for twice");
+            CreatingStreamingJobStatus::Finishing(_) => {
+                assert!(
+                    !start_consume_upstream,
+                    "should not start consuming upstream for a job again"
+                );
+                None
             }
-        }
-        Ok(())
+        };
+        Ok(graph_to_finish)
     }
 
     pub(super) fn enqueue_epoch(&mut self, epoch: u64, node_to_collect: HashSet<WorkerId>) {
@@ -458,6 +487,7 @@ impl CreatingStreamingJobControl {
         );
         if self.all_collected() {
             if let CreatingStreamingJobStatus::Finishing(finished_epoch) = self.status {
+                assert_eq!(finished_epoch, epoch);
                 Some(finished_epoch)
             } else {
                 None

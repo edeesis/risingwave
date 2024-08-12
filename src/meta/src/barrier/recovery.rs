@@ -387,7 +387,6 @@ impl GlobalBarrierManager {
                     let command_ctx = Arc::new(CommandContext::new(
                         active_streaming_nodes.current().clone(),
                         subscription_info.clone(),
-                        info.existing_table_ids().collect(),
                         prev_epoch.clone(),
                         new_epoch.clone(),
                         paused_reason,

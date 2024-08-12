@@ -151,7 +151,7 @@ impl<'a> HummockVersionTransaction<'a> {
                 }));
 
                 for (epoch, insert_ssts) in batch_commit_sst {
-                    assert!(epoch < max_committed_epoch);
+                    assert!(epoch <= max_committed_epoch);
                     let l0_sub_level_id = epoch;
                     let group_delta = GroupDelta::IntraLevel(IntraLevelDelta::new(
                         0,

@@ -436,7 +436,6 @@ pub struct CommandContext {
     /// Resolved info in this barrier loop.
     pub node_map: HashMap<WorkerId, PbWorkerNode>,
     pub subscription_info: InflightSubscriptionInfo,
-    pub table_ids_to_commit: HashSet<TableId>,
 
     pub prev_epoch: TracedEpoch,
     pub curr_epoch: TracedEpoch,
@@ -473,7 +472,6 @@ impl CommandContext {
     pub(super) fn new(
         node_map: HashMap<WorkerId, PbWorkerNode>,
         subscription_info: InflightSubscriptionInfo,
-        table_ids_to_commit: HashSet<TableId>,
         prev_epoch: TracedEpoch,
         curr_epoch: TracedEpoch,
         current_paused_reason: Option<PausedReason>,
@@ -485,7 +483,6 @@ impl CommandContext {
         Self {
             node_map,
             subscription_info,
-            table_ids_to_commit,
             prev_epoch,
             curr_epoch,
             current_paused_reason,
