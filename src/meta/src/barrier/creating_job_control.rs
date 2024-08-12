@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem::take;
 use std::sync::Arc;
+use std::time::Duration;
 
 use itertools::Itertools;
 use risingwave_common::util::epoch::Epoch;
@@ -22,7 +23,7 @@ use risingwave_pb::common::WorkerNode;
 use risingwave_pb::ddl_service::DdlProgress;
 use risingwave_pb::hummock::HummockVersionStats;
 use risingwave_pb::stream_service::BarrierCompleteResponse;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::barrier::command::CommandContext;
 use crate::barrier::info::InflightGraphInfo;
@@ -55,6 +56,7 @@ pub(super) enum CreatingStreamingJobStatus {
     },
     ConsumingLogStore {
         graph_info: InflightGraphInfo,
+        start_consume_log_store_epoch: u64,
     },
     Finishing(u64), // The prev epoch that marks it as Finishing
     Finished(u64),  // The prev epoch that marks it as Finished
@@ -66,6 +68,7 @@ pub(super) struct CreatingStreamingJobControl {
     pub(super) snapshot_backfill_info: SnapshotBackfillInfo,
     // key is prev_epoch of barrier
     inflight_barrier_queue: BTreeMap<u64, CreatingStreamingJobEpochState>,
+    max_collected_epoch: Option<u64>,
     pub(super) collected_barrier: Vec<(u64, Vec<BarrierCompleteResponse>)>,
     backfill_epoch: Epoch,
     pub(super) status: CreatingStreamingJobStatus,
@@ -103,6 +106,7 @@ impl CreatingStreamingJobControl {
             info,
             snapshot_backfill_info,
             inflight_barrier_queue: Default::default(),
+            max_collected_epoch: None,
             collected_barrier: vec![],
             backfill_epoch,
             status: CreatingStreamingJobStatus::ConsumingSnapshot {
@@ -147,7 +151,7 @@ impl CreatingStreamingJobControl {
         self.inflight_barrier_queue
             .last_key_value()
             .map(|(epoch, _)| *epoch)
-            .or_else(|| self.collected_barrier.last().map(|(epoch, _)| *epoch))
+            .or(self.max_collected_epoch)
     }
 
     pub(super) fn gen_ddl_progress(&self) -> DdlProgress {
@@ -166,9 +170,21 @@ impl CreatingStreamingJobControl {
                     format!("ConsumingSnapshot [{}]", progress.progress)
                 }
             }
-            CreatingStreamingJobStatus::ConsumingLogStore { .. } => {
+            CreatingStreamingJobStatus::ConsumingLogStore {
+                start_consume_log_store_epoch,
+                ..
+            } => {
+                let max_collected_epoch = self
+                    .max_collected_epoch
+                    .expect("should have collected some epoch when entering ConsumingLogStore");
+                let lag = Duration::from_millis(
+                    Epoch(*start_consume_log_store_epoch)
+                        .physical_time()
+                        .saturating_sub(Epoch(max_collected_epoch).physical_time()),
+                );
                 format!(
-                    "ConsumingLogStore [remaining epoch count: {}]",
+                    "ConsumingLogStore [wait finish lag: {:?},inflight epoch count: {}]",
+                    lag,
                     self.inflight_barrier_queue.len()
                 )
             }
@@ -196,10 +212,10 @@ impl CreatingStreamingJobControl {
         match &self.status {
             CreatingStreamingJobStatus::ConsumingSnapshot { .. } => Some(self.backfill_epoch.0),
             CreatingStreamingJobStatus::ConsumingLogStore { .. } => {
-                if let Some((latest_collected_epoch, _)) = self.collected_barrier.last()
-                    && *latest_collected_epoch > self.backfill_epoch.0
+                if let Some(max_collected_epoch) = self.max_collected_epoch
+                    && max_collected_epoch > self.backfill_epoch.0
                 {
-                    Some(*latest_collected_epoch)
+                    Some(max_collected_epoch)
                 } else {
                     Some(self.backfill_epoch.0)
                 }
@@ -207,10 +223,10 @@ impl CreatingStreamingJobControl {
             CreatingStreamingJobStatus::Finishing(_) | CreatingStreamingJobStatus::Finished(_) => {
                 if self.inflight_barrier_queue.is_empty() {
                     None
-                } else if let Some((latest_collected_epoch, _)) = self.collected_barrier.last()
-                    && *latest_collected_epoch > self.backfill_epoch.0
+                } else if let Some(max_collected_epoch) = self.max_collected_epoch
+                    && max_collected_epoch > self.backfill_epoch.0
                 {
-                    Some(*latest_collected_epoch)
+                    Some(max_collected_epoch)
                 } else {
                     Some(self.backfill_epoch.0)
                 }
@@ -222,6 +238,7 @@ impl CreatingStreamingJobControl {
         &mut self,
         control_stream_manager: &mut ControlStreamManager,
         is_checkpoint: bool,
+        global_prev_epoch: u64,
     ) -> MetaResult<()> {
         if let CreatingStreamingJobStatus::ConsumingSnapshot {
             prev_epoch_fake_physical_time,
@@ -265,7 +282,10 @@ impl CreatingStreamingJobControl {
                     )?;
                     self.enqueue_epoch(command.prev_epoch.value().0, node_to_collect);
                 }
-                self.status = CreatingStreamingJobStatus::ConsumingLogStore { graph_info };
+                self.status = CreatingStreamingJobStatus::ConsumingLogStore {
+                    graph_info,
+                    start_consume_log_store_epoch: global_prev_epoch,
+                };
             } else {
                 let prev_epoch =
                     TracedEpoch::new(Epoch::from_physical_time(*prev_epoch_fake_physical_time));
@@ -316,7 +336,7 @@ impl CreatingStreamingJobControl {
                 );
                 pending_commands.push(command_ctx.clone());
             }
-            CreatingStreamingJobStatus::ConsumingLogStore { graph_info } => {
+            CreatingStreamingJobStatus::ConsumingLogStore { graph_info, .. } => {
                 let node_to_collect = control_stream_manager.inject_barrier(
                     Some(table_id),
                     if to_finish {
@@ -356,6 +376,10 @@ impl CreatingStreamingJobControl {
         }
         if node_to_collect.is_empty() {
             self.collected_barrier.push((epoch, vec![]));
+            if let Some(max_collected_epoch) = self.max_collected_epoch {
+                assert!(epoch > max_collected_epoch);
+            }
+            self.max_collected_epoch = Some(epoch);
         } else {
             self.inflight_barrier_queue.insert(
                 epoch,
@@ -407,6 +431,10 @@ impl CreatingStreamingJobControl {
             if state.node_to_collect.is_empty() {
                 let (epoch, state) = self.inflight_barrier_queue.pop_first().expect("non-empty");
                 self.collected_barrier.push((epoch, state.resps));
+                if let Some(max_collected_epoch) = self.max_collected_epoch {
+                    assert!(epoch > max_collected_epoch);
+                }
+                self.max_collected_epoch = Some(epoch);
             } else {
                 break;
             }
@@ -430,17 +458,25 @@ impl CreatingStreamingJobControl {
     }
 
     pub(super) fn should_finish(&self) -> Option<InflightGraphInfo> {
-        if let CreatingStreamingJobStatus::ConsumingLogStore { graph_info } = &self.status {
-            // TODO: should have a new policy before merged
-            let len = self
-                .collected_barrier
-                .iter()
-                .filter(|(epoch, _)| *epoch > self.backfill_epoch.0)
-                .count();
-            warn!(len, "jobs finished, waiting to collect more");
-            if len > 10 {
+        if let CreatingStreamingJobStatus::ConsumingLogStore {
+            graph_info,
+            start_consume_log_store_epoch,
+        } = &self.status
+        {
+            let max_collected_epoch = self
+                .max_collected_epoch
+                .expect("should have collected some epoch when entering `ConsumingLogStore`");
+            if max_collected_epoch >= *start_consume_log_store_epoch {
                 Some(graph_info.clone())
             } else {
+                let lag = Duration::from_millis(
+                    Epoch(*start_consume_log_store_epoch).physical_time()
+                        - Epoch(max_collected_epoch).physical_time(),
+                );
+                debug!(
+                    ?lag,
+                    max_collected_epoch, start_consume_log_store_epoch, "wait consuming log store"
+                );
                 None
             }
         } else {
