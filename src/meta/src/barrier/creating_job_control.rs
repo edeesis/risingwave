@@ -59,7 +59,7 @@ pub(super) enum CreatingStreamingJobStatus {
         start_consume_log_store_epoch: u64,
     },
     ConsumingUpstream(u64), // The prev epoch that starts consuming upstream
-    Finished(u64),          // The prev epoch that marks it as Finished
+    Finishing(u64),         // The prev epoch that will finish at
 }
 
 #[derive(Debug)]
@@ -132,7 +132,7 @@ impl CreatingStreamingJobControl {
                         graph_info.contains_worker(worker_id)
                     }
                     CreatingStreamingJobStatus::ConsumingUpstream(_)
-                    | CreatingStreamingJobStatus::Finished(_) => false,
+                    | CreatingStreamingJobStatus::Finishing(_) => false,
                 }
             }
     }
@@ -144,7 +144,7 @@ impl CreatingStreamingJobControl {
                 graph_info.on_new_worker_node_map(node_map)
             }
             CreatingStreamingJobStatus::ConsumingUpstream(_)
-            | CreatingStreamingJobStatus::Finished(_) => {}
+            | CreatingStreamingJobStatus::Finishing(_) => {}
         }
     }
 
@@ -195,7 +195,7 @@ impl CreatingStreamingJobControl {
                     self.inflight_barrier_queue.len()
                 )
             }
-            CreatingStreamingJobStatus::Finished(_) => {
+            CreatingStreamingJobStatus::Finishing(_) => {
                 format!(
                     "Finished [remaining epoch count: {}]",
                     self.inflight_barrier_queue.len()
@@ -222,7 +222,7 @@ impl CreatingStreamingJobControl {
                 }
             }
             CreatingStreamingJobStatus::ConsumingUpstream(_)
-            | CreatingStreamingJobStatus::Finished(_) => {
+            | CreatingStreamingJobStatus::Finishing(_) => {
                 if self.inflight_barrier_queue.is_empty() {
                     None
                 } else if let Some(max_collected_epoch) = self.max_collected_epoch
@@ -367,7 +367,7 @@ impl CreatingStreamingJobControl {
                 }
             }
             CreatingStreamingJobStatus::ConsumingUpstream(_)
-            | CreatingStreamingJobStatus::Finished(_) => {
+            | CreatingStreamingJobStatus::Finishing(_) => {
                 assert!(!start_consume_upstream, "should not finish a job for twice");
             }
         }
@@ -457,7 +457,7 @@ impl CreatingStreamingJobControl {
             "collect"
         );
         if self.all_collected() {
-            if let CreatingStreamingJobStatus::Finished(finished_epoch) = self.status {
+            if let CreatingStreamingJobStatus::Finishing(finished_epoch) = self.status {
                 Some(finished_epoch)
             } else {
                 None

@@ -305,7 +305,7 @@ impl CheckpointControl {
     ) {
         let timer = self.context.metrics.barrier_latency.start_timer();
 
-        let mut newly_finished_table_ids = HashSet::new();
+        let mut table_ids_to_finish = HashSet::new();
 
         for (table_id, creating_streaming_job) in &mut self.creating_streaming_job_controls {
             match creating_streaming_job.status {
@@ -316,23 +316,23 @@ impl CheckpointControl {
                         && prev_epoch != command_ctx.prev_epoch.value().0
                     {
                         // skip the job that has just merged to upstream
-                        newly_finished_table_ids.insert(*table_id);
+                        table_ids_to_finish.insert(*table_id);
                         creating_streaming_job.status =
-                            CreatingStreamingJobStatus::Finished(command_ctx.prev_epoch.value().0);
+                            CreatingStreamingJobStatus::Finishing(command_ctx.prev_epoch.value().0);
                     }
                 }
-                CreatingStreamingJobStatus::Finished(_) => {}
+                CreatingStreamingJobStatus::Finishing(_) => {}
             }
         }
 
         let mut finished_table_ids = HashMap::new();
         let mut finishing_table_ids = HashSet::new();
-        for table_id in newly_finished_table_ids {
+        for table_id in table_ids_to_finish {
             let streaming_job = self
                 .creating_streaming_job_controls
                 .get_mut(&table_id)
                 .expect("should exist");
-            assert_matches!(&streaming_job.status, CreatingStreamingJobStatus::Finished(finished_epoch) if *finished_epoch == command_ctx.prev_epoch.value().0);
+            assert_matches!(&streaming_job.status, CreatingStreamingJobStatus::Finishing(epoch) if *epoch == command_ctx.prev_epoch.value().0);
             if streaming_job.all_collected() {
                 finished_table_ids.insert(
                     table_id,
@@ -1167,7 +1167,7 @@ impl GlobalBarrierManagerContext {
         assert!(state.finishing_table_ids.is_empty());
         assert!(state.finished_table_ids.values().all(|job| {
             let prev_epoch = command_ctx.prev_epoch.value().0;
-            matches!(&job.status, CreatingStreamingJobStatus::Finished(epoch) if *epoch == prev_epoch)
+            matches!(&job.status, CreatingStreamingJobStatus::Finishing(epoch) if *epoch == prev_epoch)
                 && job.all_collected()
         }));
         let wait_commit_timer = self.metrics.barrier_wait_commit_latency.start_timer();
