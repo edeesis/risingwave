@@ -1594,13 +1594,12 @@ impl DdlController {
                 return Err(anyhow!("snapshot_backfill must be used as Foreground mode").into());
             }
             match stream_job {
-                StreamingJob::MaterializedView(_) => {}
-                StreamingJob::Sink(_, _)
-                | StreamingJob::Table(_, _, _)
-                | StreamingJob::Index(_, _)
-                | StreamingJob::Source(_) => {
+                StreamingJob::MaterializedView(_)
+                | StreamingJob::Sink(_, _)
+                | StreamingJob::Index(_, _) => {}
+                StreamingJob::Table(_, _, _) | StreamingJob::Source(_) => {
                     return Err(anyhow!(
-                        "snapshot_backfill only enable for create materialized view"
+                        "snapshot_backfill not enabled for table and source"
                     )
                     .into());
                 }
