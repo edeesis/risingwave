@@ -250,7 +250,7 @@ pub enum Command {
         info: CreateStreamingJobCommandInfo,
         job_type: CreateStreamingJobType,
     },
-    FinishCreateSnapshotBackfillStreamingJobs(
+    MergeSnapshotBackfillStreamingJobs(
         HashMap<TableId, (SnapshotBackfillInfo, InflightGraphInfo)>,
     ),
     /// `CancelStreamingJob` command generates a `Stop` barrier including the actors of the given
@@ -378,7 +378,7 @@ impl Command {
                     .collect(),
             ),
             Command::ReplaceTable(plan) => Some(plan.fragment_changes()),
-            Command::FinishCreateSnapshotBackfillStreamingJobs(_) => None,
+            Command::MergeSnapshotBackfillStreamingJobs(_) => None,
             Command::SourceSplitAssignment(_) => None,
             Command::Throttle(_) => None,
             Command::CreateSubscription { .. } => None,
@@ -630,9 +630,9 @@ impl CommandContext {
                         add
                     }
                 }
-                Command::FinishCreateSnapshotBackfillStreamingJobs(jobs_to_finish) => {
+                Command::MergeSnapshotBackfillStreamingJobs(jobs_to_merge) => {
                     Some(Mutation::DropSubscriptions(DropSubscriptionsMutation {
-                        info: jobs_to_finish
+                        info: jobs_to_merge
                             .iter()
                             .flat_map(|(table_id, (backfill_info, _))| {
                                 backfill_info.upstream_mv_table_ids.iter().map(
@@ -1228,7 +1228,7 @@ impl CommandContext {
                 }
             },
             Command::DropSubscription { .. } => {}
-            Command::FinishCreateSnapshotBackfillStreamingJobs(_) => {}
+            Command::MergeSnapshotBackfillStreamingJobs(_) => {}
         }
 
         Ok(())

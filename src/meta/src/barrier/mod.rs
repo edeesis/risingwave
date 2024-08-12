@@ -273,12 +273,12 @@ impl CheckpointControl {
             .set(self.total_command_num() as i64);
     }
 
-    fn job_to_finish(&self) -> Option<HashMap<TableId, (SnapshotBackfillInfo, InflightGraphInfo)>> {
-        let mut table_ids_to_finish = HashMap::new();
+    fn jobs_to_merge(&self) -> Option<HashMap<TableId, (SnapshotBackfillInfo, InflightGraphInfo)>> {
+        let mut table_ids_to_merge = HashMap::new();
 
         for (table_id, creating_streaming_job) in &self.creating_streaming_job_controls {
-            if let Some(graph_info) = creating_streaming_job.should_finish() {
-                table_ids_to_finish.insert(
+            if let Some(graph_info) = creating_streaming_job.should_merge_to_upstream() {
+                table_ids_to_merge.insert(
                     *table_id,
                     (
                         creating_streaming_job.snapshot_backfill_info.clone(),
@@ -287,10 +287,10 @@ impl CheckpointControl {
                 );
             }
         }
-        if table_ids_to_finish.is_empty() {
+        if table_ids_to_merge.is_empty() {
             None
         } else {
-            Some(table_ids_to_finish)
+            Some(table_ids_to_merge)
         }
     }
 
@@ -311,11 +311,11 @@ impl CheckpointControl {
             match creating_streaming_job.status {
                 CreatingStreamingJobStatus::ConsumingSnapshot { .. }
                 | CreatingStreamingJobStatus::ConsumingLogStore { .. } => {}
-                CreatingStreamingJobStatus::Finishing(prev_epoch) => {
+                CreatingStreamingJobStatus::ConsumingUpstream(prev_epoch) => {
                     if command_ctx.kind.is_checkpoint()
                         && prev_epoch != command_ctx.prev_epoch.value().0
                     {
-                        // skip the job that has just marked as Finishing
+                        // skip the job that has just merged to upstream
                         newly_finished_table_ids.insert(*table_id);
                         creating_streaming_job.status =
                             CreatingStreamingJobStatus::Finished(command_ctx.prev_epoch.value().0);
@@ -991,9 +991,9 @@ impl GlobalBarrierManager {
 
         // Collect the jobs to finish
         if let (BarrierKind::Checkpoint(_), Command::Plain(None)) = (&kind, &command)
-            && let Some(jobs_to_finish) = self.checkpoint_control.job_to_finish()
+            && let Some(jobs_to_merge) = self.checkpoint_control.jobs_to_merge()
         {
-            command = Command::FinishCreateSnapshotBackfillStreamingJobs(jobs_to_finish);
+            command = Command::MergeSnapshotBackfillStreamingJobs(jobs_to_merge);
         }
 
         let (pre_applied_graph_info, pre_applied_subscription_info) =
