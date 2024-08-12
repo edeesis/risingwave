@@ -250,9 +250,7 @@ pub enum Command {
         info: CreateStreamingJobCommandInfo,
         job_type: CreateStreamingJobType,
     },
-    MergeSnapshotBackfillStreamingJobs(
-        HashMap<TableId, (SnapshotBackfillInfo, InflightGraphInfo)>,
-    ),
+    MergeSnapshotBackfillStreamingJobs(HashMap<TableId, (SnapshotBackfillInfo, InflightGraphInfo)>),
     /// `CancelStreamingJob` command generates a `Stop` barrier including the actors of the given
     /// table fragment.
     ///

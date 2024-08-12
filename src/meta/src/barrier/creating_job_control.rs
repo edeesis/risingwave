@@ -59,7 +59,7 @@ pub(super) enum CreatingStreamingJobStatus {
         start_consume_log_store_epoch: u64,
     },
     ConsumingUpstream(u64), // The prev epoch that starts consuming upstream
-    Finished(u64),  // The prev epoch that marks it as Finished
+    Finished(u64),          // The prev epoch that marks it as Finished
 }
 
 #[derive(Debug)]
@@ -143,7 +143,8 @@ impl CreatingStreamingJobControl {
             | CreatingStreamingJobStatus::ConsumingLogStore { graph_info, .. } => {
                 graph_info.on_new_worker_node_map(node_map)
             }
-            CreatingStreamingJobStatus::ConsumingUpstream(_) | CreatingStreamingJobStatus::Finished(_) => {}
+            CreatingStreamingJobStatus::ConsumingUpstream(_)
+            | CreatingStreamingJobStatus::Finished(_) => {}
         }
     }
 
@@ -220,7 +221,8 @@ impl CreatingStreamingJobControl {
                     Some(self.backfill_epoch.0)
                 }
             }
-            CreatingStreamingJobStatus::ConsumingUpstream(_) | CreatingStreamingJobStatus::Finished(_) => {
+            CreatingStreamingJobStatus::ConsumingUpstream(_)
+            | CreatingStreamingJobStatus::Finished(_) => {
                 if self.inflight_barrier_queue.is_empty() {
                     None
                 } else if let Some(max_collected_epoch) = self.max_collected_epoch
@@ -319,14 +321,14 @@ impl CreatingStreamingJobControl {
         command_ctx: &Arc<CommandContext>,
     ) -> MetaResult<()> {
         let table_id = self.info.table_fragments.table_id();
-        let start_consume_upstream =
-            if let Command::MergeSnapshotBackfillStreamingJobs(jobs_to_merge) =
-                &command_ctx.command
-            {
-                jobs_to_merge.contains_key(&table_id)
-            } else {
-                false
-            };
+        let start_consume_upstream = if let Command::MergeSnapshotBackfillStreamingJobs(
+            jobs_to_merge,
+        ) = &command_ctx.command
+        {
+            jobs_to_merge.contains_key(&table_id)
+        } else {
+            false
+        };
         match &mut self.status {
             CreatingStreamingJobStatus::ConsumingSnapshot {
                 pending_commands, ..
@@ -359,11 +361,13 @@ impl CreatingStreamingJobControl {
                 )?;
                 self.enqueue_epoch(command_ctx.prev_epoch.value().0, node_to_collect);
                 if start_consume_upstream {
-                    self.status =
-                        CreatingStreamingJobStatus::ConsumingUpstream(command_ctx.prev_epoch.value().0);
+                    self.status = CreatingStreamingJobStatus::ConsumingUpstream(
+                        command_ctx.prev_epoch.value().0,
+                    );
                 }
             }
-            CreatingStreamingJobStatus::ConsumingUpstream(_) | CreatingStreamingJobStatus::Finished(_) => {
+            CreatingStreamingJobStatus::ConsumingUpstream(_)
+            | CreatingStreamingJobStatus::Finished(_) => {
                 assert!(!start_consume_upstream, "should not finish a job for twice");
             }
         }
