@@ -52,9 +52,7 @@ use tracing::{debug, error, info, warn, Instrument};
 
 use self::command::CommandContext;
 use self::notifier::Notifier;
-use crate::barrier::creating_job_control::{
-    CreatingStreamingJobControl, CreatingStreamingJobStatus,
-};
+use crate::barrier::creating_job::{CreatingStreamingJobControl, CreatingStreamingJobStatus};
 use crate::barrier::info::InflightGraphInfo;
 use crate::barrier::notifier::BarrierInfo;
 use crate::barrier::progress::{CreateMviewProgressTracker, TrackingCommand, TrackingJob};
@@ -74,7 +72,7 @@ use crate::stream::{ScaleControllerRef, SourceManagerRef};
 use crate::{MetaError, MetaResult};
 
 mod command;
-mod creating_job_control;
+mod creating_job;
 mod info;
 mod notifier;
 mod progress;
