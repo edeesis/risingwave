@@ -937,7 +937,7 @@ impl GlobalBarrierManager {
                     CreatingStreamingJobControl::new(
                         info.clone(),
                         snapshot_backfill_info.clone(),
-                        prev_epoch.value(),
+                        prev_epoch.value().0,
                         &self.checkpoint_control.hummock_version_stats,
                     ),
                 );
@@ -951,8 +951,8 @@ impl GlobalBarrierManager {
         {
             creating_job.may_inject_fake_barrier(
                 &mut self.control_stream_manager,
-                checkpoint,
                 prev_epoch.value().0,
+                checkpoint,
             )?
         }
 
@@ -1008,7 +1008,7 @@ impl GlobalBarrierManager {
             if let CreatingStreamingJobStatus::ConsumingSnapshot {
                 snapshot_backfill_actors,
                 ..
-            } = &creating_job.status
+            } = creating_job.status()
             {
                 for (worker_id, actors) in snapshot_backfill_actors {
                     all_snapshot_backfilling_actors
@@ -1163,10 +1163,10 @@ impl GlobalBarrierManagerContext {
         } = node;
         assert!(state.node_to_collect.is_empty());
         assert!(state.creating_jobs_to_wait.is_empty());
-        assert!(state.finished_table_ids.values().all(|job| {
-            matches!(&job.status, CreatingStreamingJobStatus::Finishing {attached_epoch} if attached_epoch.is_empty())
-                && job.all_collected()
-        }));
+        assert!(state
+            .finished_table_ids
+            .values()
+            .all(|job| job.is_finished()));
         let wait_commit_timer = self.metrics.barrier_wait_commit_latency.start_timer();
         if !state.finished_table_ids.is_empty() {
             assert!(command_ctx.kind.is_checkpoint());
@@ -1536,8 +1536,14 @@ fn collect_commit_epoch_info(
         .finished_table_ids
         .into_values()
         .map(|job| BatchCommitForNewCg {
+            table_ids: job
+                .info
+                .table_fragments
+                .all_table_ids()
+                .map(TableId::new)
+                .collect(),
             epoch_to_ssts: job
-                .collected_barrier
+                .into_epoch_ssts()
                 .into_iter()
                 .map(|(epoch, resps)| {
                     (
@@ -1557,12 +1563,6 @@ fn collect_commit_epoch_info(
                             .collect(),
                     )
                 })
-                .collect(),
-            table_ids: job
-                .info
-                .table_fragments
-                .all_table_ids()
-                .map(TableId::new)
                 .collect(),
         })
         .collect();
