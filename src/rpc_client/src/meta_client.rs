@@ -241,7 +241,7 @@ impl MetaClient {
         let init_result: Result<_> = tokio_retry::Retry::spawn(retry_strategy, || async {
             let grpc_meta_client = GrpcMetaClient::new(&addr_strategy, meta_config.clone()).await?;
 
-            let add_worker_resp = grpc_meta_client
+            let result = grpc_meta_client
                 .add_worker_node(AddWorkerNodeRequest {
                     worker_type: worker_type as i32,
                     host: Some(addr.to_protobuf()),
@@ -252,7 +252,18 @@ impl MetaClient {
                         total_cpu_cores: total_cpu_available() as _,
                     }),
                 })
-                .await?;
+                .await;
+
+            if let Err(e) = &result {
+                let message = e.to_report_string();
+                if message.contains("CPU core limit") {
+                    tracing::error!(error = message, "CPU core limit exceeded");
+                    std::process::exit(1);
+                }
+            }
+
+            let add_worker_resp = result?;
+
             if let Some(status) = &add_worker_resp.status
                 && status.code() == risingwave_pb::common::status::Code::UnknownWorker
             {

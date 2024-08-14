@@ -115,7 +115,12 @@ impl ClusterManager {
         let mut property = self.parse_property(r#type, property);
         let mut core = self.core.write().await;
 
-        core.check_compute_cpu_core_limit_on_newly_joined_worker(host_address.clone(), &resource)?;
+        if let WorkerType::ComputeNode = r#type {
+            core.check_cpu_core_limit_on_newly_joined_compute_node(
+                host_address.clone(),
+                &resource,
+            )?;
+        }
 
         if let Some(worker) = core.get_worker_by_host_mut(host_address.clone()) {
             tracing::info!("worker {} re-joined the cluster", worker.worker_id());
@@ -634,7 +639,7 @@ impl ClusterManagerCore {
             .map(|(_, worker)| worker.clone())
     }
 
-    pub fn check_compute_cpu_core_limit_on_newly_joined_worker(
+    pub fn check_cpu_core_limit_on_newly_joined_compute_node(
         &self,
         host_address: HostAddress,
         resource: &Resource,
@@ -643,7 +648,7 @@ impl ClusterManagerCore {
 
         let this = resource.total_cpu_cores;
         let others = (self.workers.iter())
-            .filter(|(k, _v)| k != this_key)
+            .filter(|(k, _v)| k != &&this_key)
             .filter(|(_k, v)| v.worker_node.r#type == WorkerType::ComputeNode as i32)
             .flat_map(|(_k, v)| v.resource.as_ref().map(|r| r.total_cpu_cores))
             .sum::<u64>();
