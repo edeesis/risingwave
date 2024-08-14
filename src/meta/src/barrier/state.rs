@@ -99,11 +99,6 @@ impl BarrierManagerState {
         if let Some(fragment_changes) = fragment_changes {
             self.inflight_graph_info.post_apply(&fragment_changes);
         }
-        if let Command::FinishCreateSnapshotBackfillStreamingJobs(jobs_to_finish) = command {
-            for (_, graph_info) in jobs_to_finish.values() {
-                self.inflight_graph_info.extend(graph_info);
-            }
-        }
         self.inflight_subscription_info.post_apply(command);
 
         (info, subscription_info)

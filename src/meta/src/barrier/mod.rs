@@ -53,9 +53,7 @@ use tracing::{debug, error, info, warn, Instrument};
 
 use self::command::CommandContext;
 use self::notifier::Notifier;
-use crate::barrier::creating_job_control::{
-    CreatingStreamingJobControl, CreatingStreamingJobStatus,
-};
+use crate::barrier::creating_job::{CreatingStreamingJobControl, CreatingStreamingJobStatus};
 use crate::barrier::info::InflightGraphInfo;
 use crate::barrier::notifier::BarrierInfo;
 use crate::barrier::progress::{CreateMviewProgressTracker, TrackingCommand, TrackingJob};
@@ -73,7 +71,7 @@ use crate::stream::{ScaleControllerRef, SourceManagerRef};
 use crate::{MetaError, MetaResult};
 
 mod command;
-mod creating_job_control;
+mod creating_job;
 mod info;
 mod notifier;
 mod progress;
@@ -272,12 +270,12 @@ impl CheckpointControl {
             .set(self.total_command_num() as i64);
     }
 
-    fn job_to_finish(&self) -> Option<HashMap<TableId, (SnapshotBackfillInfo, InflightGraphInfo)>> {
-        let mut table_ids_to_finish = HashMap::new();
+    fn jobs_to_merge(&self) -> Option<HashMap<TableId, (SnapshotBackfillInfo, InflightGraphInfo)>> {
+        let mut table_ids_to_merge = HashMap::new();
 
         for (table_id, creating_streaming_job) in &self.creating_streaming_job_controls {
-            if let Some(graph_info) = creating_streaming_job.should_finish() {
-                table_ids_to_finish.insert(
+            if let Some(graph_info) = creating_streaming_job.should_merge_to_upstream() {
+                table_ids_to_merge.insert(
                     *table_id,
                     (
                         creating_streaming_job.snapshot_backfill_info.clone(),
@@ -286,10 +284,10 @@ impl CheckpointControl {
                 );
             }
         }
-        if table_ids_to_finish.is_empty() {
+        if table_ids_to_merge.is_empty() {
             None
         } else {
-            Some(table_ids_to_finish)
+            Some(table_ids_to_merge)
         }
     }
 
@@ -301,49 +299,10 @@ impl CheckpointControl {
         command_ctx: Arc<CommandContext>,
         notifiers: Vec<Notifier>,
         node_to_collect: HashSet<WorkerId>,
+        jobs_to_wait: HashSet<TableId>,
+        table_ids_to_commit: HashSet<TableId>,
     ) {
         let timer = self.context.metrics.barrier_latency.start_timer();
-
-        let mut newly_finished_table_ids = HashSet::new();
-
-        for (table_id, creating_streaming_job) in &mut self.creating_streaming_job_controls {
-            match creating_streaming_job.status {
-                CreatingStreamingJobStatus::ConsumingSnapshot { .. }
-                | CreatingStreamingJobStatus::ConsumingLogStore { .. } => {}
-                CreatingStreamingJobStatus::Finishing(prev_epoch) => {
-                    if command_ctx.kind.is_checkpoint()
-                        && prev_epoch != command_ctx.prev_epoch.value().0
-                    {
-                        // skip the job that has just marked as Finishing
-                        newly_finished_table_ids.insert(*table_id);
-                        creating_streaming_job.status =
-                            CreatingStreamingJobStatus::Finished(command_ctx.prev_epoch.value().0);
-                    }
-                }
-                CreatingStreamingJobStatus::Finished(_) => {}
-            }
-        }
-
-        let mut finished_table_ids = HashMap::new();
-        let mut finishing_table_ids = HashSet::new();
-        for table_id in newly_finished_table_ids {
-            let streaming_job = self
-                .creating_streaming_job_controls
-                .get_mut(&table_id)
-                .expect("should exist");
-            assert_matches!(&streaming_job.status, CreatingStreamingJobStatus::Finished(finished_epoch) if *finished_epoch == command_ctx.prev_epoch.value().0);
-            if streaming_job.all_completed() {
-                finished_table_ids.insert(
-                    table_id,
-                    self.creating_streaming_job_controls
-                        .remove(&table_id)
-                        .expect("should exist")
-                        .info,
-                );
-            } else {
-                finishing_table_ids.insert(table_id);
-            }
-        }
 
         if let Some((_, node)) = self.command_ctx_queue.last_key_value() {
             assert_eq!(
@@ -354,7 +313,7 @@ impl CheckpointControl {
 
         debug!(
             prev_epoch = command_ctx.prev_epoch.value().0,
-            ?finishing_table_ids,
+            ?jobs_to_wait,
             "enqueue command"
         );
         self.command_ctx_queue.insert(
@@ -364,8 +323,9 @@ impl CheckpointControl {
                 state: BarrierEpochState {
                     node_to_collect,
                     resps: vec![],
-                    finishing_table_ids,
-                    finished_table_ids,
+                    creating_jobs_to_wait: jobs_to_wait,
+                    finished_table_ids: HashMap::new(),
+                    table_ids_to_commit,
                 },
                 command_ctx,
                 notifiers,
@@ -399,7 +359,7 @@ impl CheckpointControl {
             self.creating_streaming_job_controls
                 .get_mut(&creating_table_id)
                 .expect("should exist")
-                .collect(prev_epoch, worker_id, resp)
+                .collect(prev_epoch, worker_id, resp);
         }
     }
 
@@ -562,14 +522,16 @@ struct BarrierEpochState {
 
     resps: Vec<BarrierCompleteResponse>,
 
-    finishing_table_ids: HashSet<TableId>,
+    creating_jobs_to_wait: HashSet<TableId>,
 
     finished_table_ids: HashMap<TableId, CreateStreamingJobCommandInfo>,
+
+    table_ids_to_commit: HashSet<TableId>,
 }
 
 impl BarrierEpochState {
     fn is_inflight(&self) -> bool {
-        !self.node_to_collect.is_empty() || !self.finishing_table_ids.is_empty()
+        !self.node_to_collect.is_empty() || !self.creating_jobs_to_wait.is_empty()
     }
 }
 
@@ -966,7 +928,7 @@ impl GlobalBarrierManager {
                     CreatingStreamingJobControl::new(
                         info.clone(),
                         snapshot_backfill_info.clone(),
-                        prev_epoch.value(),
+                        prev_epoch.value().0,
                         &self.checkpoint_control.hummock_version_stats,
                     ),
                 );
@@ -980,8 +942,8 @@ impl GlobalBarrierManager {
         {
             creating_job.may_inject_fake_barrier(
                 &mut self.control_stream_manager,
-                checkpoint,
                 prev_epoch.value().0,
+                checkpoint,
             )?
         }
 
@@ -998,9 +960,9 @@ impl GlobalBarrierManager {
 
         // Collect the jobs to finish
         if let (BarrierKind::Checkpoint(_), Command::Plain(None)) = (&kind, &command)
-            && let Some(jobs_to_finish) = self.checkpoint_control.job_to_finish()
+            && let Some(jobs_to_merge) = self.checkpoint_control.jobs_to_merge()
         {
-            command = Command::FinishCreateSnapshotBackfillStreamingJobs(jobs_to_finish);
+            command = Command::MergeSnapshotBackfillStreamingJobs(jobs_to_merge);
         }
 
         let (pre_applied_graph_info, pre_applied_subscription_info) =
@@ -1015,7 +977,6 @@ impl GlobalBarrierManager {
         let command_ctx = Arc::new(CommandContext::new(
             self.active_streaming_nodes.current().clone(),
             pre_applied_subscription_info,
-            pre_applied_graph_info.existing_table_ids().collect(),
             prev_epoch.clone(),
             curr_epoch.clone(),
             self.state.paused_reason(),
@@ -1027,17 +988,17 @@ impl GlobalBarrierManager {
 
         send_latency_timer.observe_duration();
 
-        let mut all_snapshot_backfilling_actors: HashMap<_, Vec<_>> = HashMap::new();
+        let table_ids_to_commit: HashSet<_> = pre_applied_graph_info.existing_table_ids().collect();
 
-        for creating_job in self
-            .checkpoint_control
-            .creating_streaming_job_controls
-            .values_mut()
+        let mut all_snapshot_backfilling_actors: HashMap<_, Vec<_>> = HashMap::new();
+        let mut jobs_to_wait = HashSet::new();
+
+        for (table_id, creating_job) in &mut self.checkpoint_control.creating_streaming_job_controls
         {
             if let CreatingStreamingJobStatus::ConsumingSnapshot {
                 snapshot_backfill_actors,
                 ..
-            } = &creating_job.status
+            } = creating_job.status()
             {
                 for (worker_id, actors) in snapshot_backfill_actors {
                     all_snapshot_backfilling_actors
@@ -1046,7 +1007,14 @@ impl GlobalBarrierManager {
                         .extend(actors.iter().cloned())
                 }
             }
-            creating_job.on_new_command(&mut self.control_stream_manager, &command_ctx)?
+            if let Some(wait_job) =
+                creating_job.on_new_command(&mut self.control_stream_manager, &command_ctx)?
+            {
+                jobs_to_wait.insert(*table_id);
+                if let Some(graph_to_finish) = wait_job {
+                    self.state.inflight_graph_info.extend(graph_to_finish);
+                }
+            }
         }
 
         let node_to_collect = match self.control_stream_manager.inject_command_ctx_barrier(
@@ -1080,8 +1048,13 @@ impl GlobalBarrierManager {
         // Update the paused state after the barrier is injected.
         self.state.set_paused_reason(curr_paused_reason);
         // Record the in-flight barrier.
-        self.checkpoint_control
-            .enqueue_command(command_ctx, notifiers, node_to_collect);
+        self.checkpoint_control.enqueue_command(
+            command_ctx,
+            notifiers,
+            node_to_collect,
+            jobs_to_wait,
+            table_ids_to_commit,
+        );
 
         Ok(())
     }
@@ -1176,7 +1149,7 @@ impl GlobalBarrierManagerContext {
             new_table_fragment_info,
             change_log_delta: Default::default(),
             committed_epoch: epoch,
-            tables_to_commit: tables_to_commit.clone(),
+            tables_to_commit,
             is_visible_table_committed_epoch: false,
         };
         self.hummock_manager.commit_epoch(info).await?;
@@ -1192,6 +1165,7 @@ impl GlobalBarrierManagerContext {
     ) -> MetaResult<Option<HummockVersionStats>> {
         debug!(
             prev_epoch = node.command_ctx.prev_epoch.value().0,
+            kind = ?node.command_ctx.kind,
             "complete barrier"
         );
         let EpochNode {
@@ -1202,7 +1176,7 @@ impl GlobalBarrierManagerContext {
             ..
         } = node;
         assert!(state.node_to_collect.is_empty());
-        assert!(state.finishing_table_ids.is_empty());
+        assert!(state.creating_jobs_to_wait.is_empty());
         let wait_commit_timer = self.metrics.barrier_wait_commit_latency.start_timer();
         if !state.finished_table_ids.is_empty() {
             assert!(command_ctx.kind.is_checkpoint());
@@ -1215,7 +1189,12 @@ impl GlobalBarrierManagerContext {
         }));
 
         let result = self
-            .update_snapshot(&command_ctx, state.resps, backfill_progress)
+            .update_snapshot(
+                &command_ctx,
+                state.table_ids_to_commit,
+                state.resps,
+                backfill_progress,
+            )
             .await;
 
         let version_stats = match result {
@@ -1247,6 +1226,7 @@ impl GlobalBarrierManagerContext {
     async fn update_snapshot(
         &self,
         command_ctx: &CommandContext,
+        tables_to_commit: HashSet<TableId>,
         resps: Vec<BarrierCompleteResponse>,
         backfill_progress: HashMap<TableId, (u64, HashSet<TableId>)>,
     ) -> MetaResult<Option<HummockVersionStats>> {
@@ -1268,6 +1248,7 @@ impl GlobalBarrierManagerContext {
                             command_ctx,
                             epochs,
                             backfill_progress,
+                            tables_to_commit,
                         );
                         new_snapshot = self.hummock_manager.commit_epoch(commit_info).await?;
                     }
@@ -1397,7 +1378,7 @@ impl CheckpointControl {
                 && !state.is_inflight()
             {
                 let (_, node) = self.command_ctx_queue.pop_first().expect("non-empty");
-                assert!(node.state.finishing_table_ids.is_empty());
+                assert!(node.state.creating_jobs_to_wait.is_empty());
                 let table_ids_to_finish = node.state.finished_table_ids.keys().cloned().collect();
                 let finished_jobs = self
                     .create_mview_tracker
@@ -1424,7 +1405,17 @@ impl CheckpointControl {
                 };
             } else {
                 for (table_id, job) in &mut self.creating_streaming_job_controls {
-                    if let Some((epoch, resps, is_first_time)) = job.start_completing() {
+                    let (upstream_epochs_to_notify, commit_info) = job.start_completing();
+                    for upstream_epoch in upstream_epochs_to_notify {
+                        assert!(self
+                            .command_ctx_queue
+                            .get_mut(&upstream_epoch)
+                            .expect("should exist")
+                            .state
+                            .creating_jobs_to_wait
+                            .remove(table_id));
+                    }
+                    if let Some((epoch, resps, is_first_time)) = commit_info {
                         let tables_to_commit = job
                             .info
                             .table_fragments
@@ -1501,26 +1492,34 @@ impl CheckpointControl {
                     CompletingCommand::None
                 };
                 self.completing_command = next_completing_command_status;
-                if let Some(finished_epoch) = self
+                if let Some((upstream_epoch, is_finished)) = self
                     .creating_streaming_job_controls
                     .get_mut(&table_id)
                     .expect("should exist")
                     .ack_completed(epoch)
                 {
-                    debug!(finished_epoch, ?table_id, "finish creating job");
-                    let creating_streaming_job = self
-                        .creating_streaming_job_controls
-                        .remove(&table_id)
-                        .expect("should exist");
                     let state = &mut self
                         .command_ctx_queue
-                        .get_mut(&finished_epoch)
+                        .get_mut(&upstream_epoch)
                         .expect("should exist")
                         .state;
-                    assert!(state.finishing_table_ids.remove(&table_id));
-                    state
-                        .finished_table_ids
-                        .insert(table_id, creating_streaming_job.info);
+                    assert!(state.creating_jobs_to_wait.remove(&table_id));
+                    if is_finished {
+                        debug!(epoch, ?table_id, "finish creating job");
+                        let creating_streaming_job = self
+                            .creating_streaming_job_controls
+                            .remove(&table_id)
+                            .expect("should exist");
+                        assert!(creating_streaming_job.is_finished());
+                        assert!(self
+                            .command_ctx_queue
+                            .get_mut(&upstream_epoch)
+                            .expect("should exist")
+                            .state
+                            .finished_table_ids
+                            .insert(table_id, creating_streaming_job.info)
+                            .is_none());
+                    }
                 }
                 join_result.map(|_| None)
             }
@@ -1679,6 +1678,7 @@ fn collect_commit_epoch_info(
     command_ctx: &CommandContext,
     epochs: &Vec<u64>,
     backfill_progress: HashMap<TableId, (u64, HashSet<TableId>)>,
+    tables_to_commit: HashSet<TableId>,
 ) -> CommitEpochInfo {
     let (sst_to_context, synced_ssts, new_table_watermarks, old_value_ssts) =
         collect_resp_info(resps);
@@ -1746,7 +1746,7 @@ fn collect_commit_epoch_info(
         new_table_fragment_info,
         change_log_delta: table_new_change_log,
         committed_epoch: epoch,
-        tables_to_commit: command_ctx.table_ids_to_commit.clone(),
+        tables_to_commit,
         is_visible_table_committed_epoch: true,
     }
 }

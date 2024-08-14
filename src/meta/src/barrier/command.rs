@@ -250,9 +250,7 @@ pub enum Command {
         info: CreateStreamingJobCommandInfo,
         job_type: CreateStreamingJobType,
     },
-    FinishCreateSnapshotBackfillStreamingJobs(
-        HashMap<TableId, (SnapshotBackfillInfo, InflightGraphInfo)>,
-    ),
+    MergeSnapshotBackfillStreamingJobs(HashMap<TableId, (SnapshotBackfillInfo, InflightGraphInfo)>),
     /// `CancelStreamingJob` command generates a `Stop` barrier including the actors of the given
     /// table fragment.
     ///
@@ -378,7 +376,7 @@ impl Command {
                     .collect(),
             ),
             Command::ReplaceTable(plan) => Some(plan.fragment_changes()),
-            Command::FinishCreateSnapshotBackfillStreamingJobs(_) => None,
+            Command::MergeSnapshotBackfillStreamingJobs(_) => None,
             Command::SourceSplitAssignment(_) => None,
             Command::Throttle(_) => None,
             Command::CreateSubscription { .. } => None,
@@ -438,7 +436,6 @@ pub struct CommandContext {
     /// Resolved info in this barrier loop.
     pub node_map: HashMap<WorkerId, PbWorkerNode>,
     pub subscription_info: InflightSubscriptionInfo,
-    pub table_ids_to_commit: HashSet<TableId>,
 
     pub prev_epoch: TracedEpoch,
     pub curr_epoch: TracedEpoch,
@@ -475,7 +472,6 @@ impl CommandContext {
     pub(super) fn new(
         node_map: HashMap<WorkerId, PbWorkerNode>,
         subscription_info: InflightSubscriptionInfo,
-        table_ids_to_commit: HashSet<TableId>,
         prev_epoch: TracedEpoch,
         curr_epoch: TracedEpoch,
         current_paused_reason: Option<PausedReason>,
@@ -487,7 +483,6 @@ impl CommandContext {
         Self {
             node_map,
             subscription_info,
-            table_ids_to_commit,
             prev_epoch,
             curr_epoch,
             current_paused_reason,
@@ -630,9 +625,9 @@ impl CommandContext {
                         add
                     }
                 }
-                Command::FinishCreateSnapshotBackfillStreamingJobs(jobs_to_finish) => {
+                Command::MergeSnapshotBackfillStreamingJobs(jobs_to_merge) => {
                     Some(Mutation::DropSubscriptions(DropSubscriptionsMutation {
-                        info: jobs_to_finish
+                        info: jobs_to_merge
                             .iter()
                             .flat_map(|(table_id, (backfill_info, _))| {
                                 backfill_info.upstream_mv_table_ids.iter().map(
@@ -1228,7 +1223,7 @@ impl CommandContext {
                 }
             },
             Command::DropSubscription { .. } => {}
-            Command::FinishCreateSnapshotBackfillStreamingJobs(_) => {}
+            Command::MergeSnapshotBackfillStreamingJobs(_) => {}
         }
 
         Ok(())

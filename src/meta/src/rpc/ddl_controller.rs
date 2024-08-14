@@ -1598,10 +1598,9 @@ impl DdlController {
                 | StreamingJob::Sink(_, _)
                 | StreamingJob::Index(_, _) => {}
                 StreamingJob::Table(_, _, _) | StreamingJob::Source(_) => {
-                    return Err(anyhow!(
-                        "snapshot_backfill not enabled for table and source"
-                    )
-                    .into());
+                    return Err(
+                        anyhow!("snapshot_backfill not enabled for table and source").into(),
+                    );
                 }
             }
         }

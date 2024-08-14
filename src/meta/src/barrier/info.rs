@@ -90,13 +90,12 @@ impl InflightGraphInfo {
         }
     }
 
-    pub(crate) fn extend(&mut self, other: &Self) {
-        self.apply_add(other.fragment_infos.iter().map(|(fragment_id, info)| {
-            (
-                *fragment_id,
-                CommandFragmentChanges::NewFragment(info.clone()),
-            )
-        }))
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.apply_add(
+            other.fragment_infos.into_iter().map(|(fragment_id, info)| {
+                (fragment_id, CommandFragmentChanges::NewFragment(info))
+            }),
+        )
     }
 
     /// Apply some actor changes before issuing a barrier command, if the command contains any new added actors, we should update
