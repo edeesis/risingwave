@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod barrier_control;
+mod status;
 
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
@@ -24,135 +25,19 @@ use risingwave_common::util::epoch::Epoch;
 use risingwave_pb::common::WorkerNode;
 use risingwave_pb::ddl_service::DdlProgress;
 use risingwave_pb::hummock::HummockVersionStats;
-use risingwave_pb::stream_service::barrier_complete_response::CreateMviewProgress;
 use risingwave_pb::stream_service::BarrierCompleteResponse;
 use tracing::{debug, info};
 
 use crate::barrier::command::CommandContext;
 use crate::barrier::creating_job::barrier_control::CreatingStreamingJobBarrierControl;
+use crate::barrier::creating_job::status::CreatingStreamingJobStatus;
 use crate::barrier::info::InflightGraphInfo;
 use crate::barrier::progress::CreateMviewProgressTracker;
 use crate::barrier::rpc::ControlStreamManager;
-use crate::barrier::{
-    BarrierKind, Command, CreateStreamingJobCommandInfo, SnapshotBackfillInfo, TracedEpoch,
-};
+use crate::barrier::{Command, CreateStreamingJobCommandInfo, SnapshotBackfillInfo};
 use crate::manager::WorkerId;
 use crate::model::ActorId;
 use crate::MetaResult;
-
-#[derive(Debug)]
-pub(super) enum CreatingStreamingJobStatus {
-    ConsumingSnapshot {
-        prev_epoch_fake_physical_time: u64,
-        pending_commands: Vec<Arc<CommandContext>>,
-        version_stats: HummockVersionStats,
-        create_mview_tracker: CreateMviewProgressTracker,
-        graph_info: InflightGraphInfo,
-        backfill_epoch: u64,
-        /// The `prev_epoch` of pending non checkpoint barriers
-        pending_non_checkpoint_barriers: Vec<u64>,
-        snapshot_backfill_actors: HashMap<WorkerId, HashSet<ActorId>>,
-    },
-    ConsumingLogStore {
-        graph_info: InflightGraphInfo,
-        start_consume_log_store_epoch: u64,
-    },
-    ConsumingUpstream {
-        start_consume_upstream_epoch: u64,
-        graph_info: InflightGraphInfo,
-    },
-    Finishing {
-        start_consume_upstream_epoch: u64,
-    },
-}
-
-impl CreatingStreamingJobStatus {
-    fn active_graph_info(&self) -> Option<&InflightGraphInfo> {
-        match self {
-            CreatingStreamingJobStatus::ConsumingSnapshot { graph_info, .. }
-            | CreatingStreamingJobStatus::ConsumingLogStore { graph_info, .. }
-            | CreatingStreamingJobStatus::ConsumingUpstream { graph_info, .. } => Some(graph_info),
-            CreatingStreamingJobStatus::Finishing { .. } => {
-                // when entering `Finishing`, the graph will have been added to the upstream graph,
-                // and therefore the separate graph info is inactive.
-                None
-            }
-        }
-    }
-
-    fn update_progress(
-        &mut self,
-        create_mview_progress: impl IntoIterator<Item = &CreateMviewProgress>,
-    ) {
-        if let Self::ConsumingSnapshot {
-            create_mview_tracker,
-            ref version_stats,
-            ..
-        } = self
-        {
-            create_mview_tracker.update_tracking_jobs(None, create_mview_progress, version_stats);
-        }
-    }
-
-    fn may_inject_fake_barrier(
-        &mut self,
-        upstream_epoch: u64,
-        is_checkpoint: bool,
-    ) -> Option<Vec<(TracedEpoch, TracedEpoch, BarrierKind)>> {
-        if let CreatingStreamingJobStatus::ConsumingSnapshot {
-            prev_epoch_fake_physical_time,
-            pending_commands,
-            create_mview_tracker,
-            graph_info,
-            pending_non_checkpoint_barriers,
-            ref backfill_epoch,
-            ..
-        } = self
-        {
-            if create_mview_tracker.has_pending_finished_jobs() {
-                pending_non_checkpoint_barriers.push(*backfill_epoch);
-
-                let prev_epoch = Epoch::from_physical_time(*prev_epoch_fake_physical_time);
-                let barriers_to_inject = [(
-                    TracedEpoch::new(Epoch(*backfill_epoch)),
-                    TracedEpoch::new(prev_epoch),
-                    BarrierKind::Checkpoint(take(pending_non_checkpoint_barriers)),
-                )]
-                .into_iter()
-                .chain(pending_commands.drain(..).map(|command_ctx| {
-                    (
-                        command_ctx.curr_epoch.clone(),
-                        command_ctx.prev_epoch.clone(),
-                        command_ctx.kind.clone(),
-                    )
-                }))
-                .collect();
-
-                let graph_info = take(graph_info);
-                *self = CreatingStreamingJobStatus::ConsumingLogStore {
-                    graph_info,
-                    start_consume_log_store_epoch: upstream_epoch,
-                };
-                Some(barriers_to_inject)
-            } else {
-                let prev_epoch =
-                    TracedEpoch::new(Epoch::from_physical_time(*prev_epoch_fake_physical_time));
-                *prev_epoch_fake_physical_time += 1;
-                let curr_epoch =
-                    TracedEpoch::new(Epoch::from_physical_time(*prev_epoch_fake_physical_time));
-                pending_non_checkpoint_barriers.push(prev_epoch.value().0);
-                let kind = if is_checkpoint {
-                    BarrierKind::Checkpoint(take(pending_non_checkpoint_barriers))
-                } else {
-                    BarrierKind::Barrier
-                };
-                Some(vec![(curr_epoch, prev_epoch, kind)])
-            }
-        } else {
-            None
-        }
-    }
-}
 
 #[derive(Debug)]
 pub(super) struct CreatingStreamingJobControl {
@@ -227,8 +112,20 @@ impl CreatingStreamingJobControl {
         }
     }
 
-    pub(super) fn status(&self) -> &CreatingStreamingJobStatus {
-        &self.status
+    pub(super) fn actors_to_pre_sync_barrier(
+        &self,
+    ) -> impl Iterator<Item = (&WorkerId, &HashSet<ActorId>)> + '_ {
+        if let CreatingStreamingJobStatus::ConsumingSnapshot {
+            snapshot_backfill_actors,
+            ..
+        } = &self.status
+        {
+            Some(snapshot_backfill_actors)
+        } else {
+            None
+        }
+        .into_iter()
+        .flat_map(|actors| actors.iter())
     }
 
     pub(super) fn gen_ddl_progress(&self) -> DdlProgress {
@@ -269,7 +166,7 @@ impl CreatingStreamingJobControl {
             CreatingStreamingJobStatus::ConsumingUpstream { .. } => {
                 format!(
                     "Upstream [unattached: {}, epoch cnt: {}]",
-                    self.barrier_control.unsttached_epochs().count(),
+                    self.barrier_control.unattached_epochs().count(),
                     self.barrier_control.inflight_barrier_count(),
                 )
             }
@@ -287,7 +184,7 @@ impl CreatingStreamingJobControl {
         }
     }
 
-    pub(super) fn backfill_progress(&self) -> Option<u64> {
+    pub(super) fn pinned_upstream_log_epoch(&self) -> Option<u64> {
         let stop_consume_log_store_epoch = match &self.status {
             CreatingStreamingJobStatus::ConsumingSnapshot { .. }
             | CreatingStreamingJobStatus::ConsumingLogStore { .. } => None,
@@ -415,10 +312,12 @@ impl CreatingStreamingJobControl {
                 );
 
                 let should_finish = command_ctx.kind.is_checkpoint()
-                    && self.barrier_control.unsttached_epochs().next().is_none();
+                    && self.barrier_control.unattached_epochs().next().is_none();
                 let node_to_collect = control_stream_manager.inject_barrier(
                     Some(table_id),
-                    command_ctx.to_mutation(),
+                    // do not send the upstream barrier mutation because in `ConsumingUpstream` stage,
+                    // barriers are still injected and collected independently on the creating jobs.
+                    None,
                     (&command_ctx.curr_epoch, &command_ctx.prev_epoch),
                     &command_ctx.kind,
                     graph_info,
@@ -445,7 +344,7 @@ impl CreatingStreamingJobControl {
                     };
                     Some(Some(graph_info))
                 } else {
-                    let mut unattached_epochs_iter = self.barrier_control.unsttached_epochs();
+                    let mut unattached_epochs_iter = self.barrier_control.unattached_epochs();
                     let mut epoch_to_attach = unattached_epochs_iter.next().expect("non-empty").0;
                     let mut remain_count = 5;
                     while remain_count > 0

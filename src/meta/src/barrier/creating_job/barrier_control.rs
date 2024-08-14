@@ -120,7 +120,7 @@ impl CreatingStreamingJobBarrierControl {
         }
     }
 
-    pub(super) fn unsttached_epochs(&self) -> impl Iterator<Item = (u64, bool)> + '_ {
+    pub(super) fn unattached_epochs(&self) -> impl Iterator<Item = (u64, bool)> + '_ {
         let range_start = if let Some(max_attached_epoch) = self.max_attached_epoch {
             Excluded(max_attached_epoch)
         } else {
@@ -131,6 +131,11 @@ impl CreatingStreamingJobBarrierControl {
             .map(|(epoch, state)| (*epoch, state.is_checkpoint))
     }
 
+    /// Attach an `upstream_epoch` to the `epoch` of the creating job.
+    ///
+    /// The `upstream_epoch` won't be completed until the `epoch` of the creating job is completed so that
+    /// the `upstream_epoch` should wait for the progress of creating job, and we can ensure that the downstream
+    /// creating job can eventually catch up with the upstream.
     pub(super) fn attach_upstream_epoch(&mut self, epoch: u64, upstream_epoch: u64) {
         debug!(
             epoch,
@@ -178,6 +183,10 @@ impl CreatingStreamingJobBarrierControl {
     }
 
     #[expect(clippy::type_complexity)]
+    /// Return (`upstream_epochs_to_notify`, Some((epoch, resps, `is_first_commit`)))
+    ///
+    /// `upstream_epochs_to_notify` is the upstream epochs of non-checkpoint barriers to be notified about barrier completing.
+    /// These non-checkpoint barriers does not need to call `commit_epoch` and therefore can be completed as long as collected.
     pub(super) fn start_completing(
         &mut self,
     ) -> (Vec<u64>, Option<(u64, Vec<BarrierCompleteResponse>, bool)>) {
@@ -204,6 +213,9 @@ impl CreatingStreamingJobBarrierControl {
         (upstream_epochs_to_notify, None)
     }
 
+    /// Ack on completing a checkpoint barrier.
+    ///
+    /// Return the upstream epoch to be notified when there is any.
     pub(super) fn ack_completed(&mut self, completed_epoch: u64) -> Option<u64> {
         let epoch_state = self.completing_barrier.take().expect("should exist");
         assert_eq!(epoch_state.epoch, completed_epoch);

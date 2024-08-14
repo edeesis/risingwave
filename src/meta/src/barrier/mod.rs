@@ -53,7 +53,7 @@ use tracing::{debug, error, info, warn, Instrument};
 
 use self::command::CommandContext;
 use self::notifier::Notifier;
-use crate::barrier::creating_job::{CreatingStreamingJobControl, CreatingStreamingJobStatus};
+use crate::barrier::creating_job::CreatingStreamingJobControl;
 use crate::barrier::info::InflightGraphInfo;
 use crate::barrier::notifier::BarrierInfo;
 use crate::barrier::progress::{CreateMviewProgressTracker, TrackingCommand, TrackingJob};
@@ -291,9 +291,7 @@ impl CheckpointControl {
         }
     }
 
-    /// Enqueue a barrier command, and init its state to `InFlight`.
-    ///
-    /// Return the `table_id` of streaming job that will be finished after this barrier
+    /// Enqueue a barrier command
     fn enqueue_command(
         &mut self,
         command_ctx: Arc<CommandContext>,
@@ -464,7 +462,7 @@ impl CheckpointControl {
                 if let Err(e) = self
                     .context
                     .clone()
-                    .complete_barrier(node, finished_jobs, self.collect_backfill_progress())
+                    .complete_barrier(node, finished_jobs, HashMap::new())
                     .await
                 {
                     error!(
@@ -990,22 +988,16 @@ impl GlobalBarrierManager {
 
         let table_ids_to_commit: HashSet<_> = pre_applied_graph_info.existing_table_ids().collect();
 
-        let mut all_snapshot_backfilling_actors: HashMap<_, Vec<_>> = HashMap::new();
+        let mut actors_to_pre_sync_barrier: HashMap<_, Vec<_>> = HashMap::new();
         let mut jobs_to_wait = HashSet::new();
 
         for (table_id, creating_job) in &mut self.checkpoint_control.creating_streaming_job_controls
         {
-            if let CreatingStreamingJobStatus::ConsumingSnapshot {
-                snapshot_backfill_actors,
-                ..
-            } = creating_job.status()
-            {
-                for (worker_id, actors) in snapshot_backfill_actors {
-                    all_snapshot_backfilling_actors
-                        .entry(*worker_id)
-                        .or_default()
-                        .extend(actors.iter().cloned())
-                }
+            for (worker_id, actors) in creating_job.actors_to_pre_sync_barrier() {
+                actors_to_pre_sync_barrier
+                    .entry(*worker_id)
+                    .or_default()
+                    .extend(actors.iter().cloned())
             }
             if let Some(wait_job) =
                 creating_job.on_new_command(&mut self.control_stream_manager, &command_ctx)?
@@ -1021,7 +1013,7 @@ impl GlobalBarrierManager {
             &command_ctx,
             &pre_applied_graph_info,
             Some(&self.state.inflight_graph_info),
-            all_snapshot_backfilling_actors,
+            actors_to_pre_sync_barrier,
         ) {
             Ok(node_to_collect) => node_to_collect,
             Err(err) => {
@@ -1161,7 +1153,7 @@ impl GlobalBarrierManagerContext {
         self,
         node: EpochNode,
         mut finished_jobs: Vec<TrackingJob>,
-        backfill_progress: HashMap<TableId, (u64, HashSet<TableId>)>,
+        backfill_pinned_log_epoch: HashMap<TableId, (u64, HashSet<TableId>)>,
     ) -> MetaResult<Option<HummockVersionStats>> {
         debug!(
             prev_epoch = node.command_ctx.prev_epoch.value().0,
@@ -1193,7 +1185,7 @@ impl GlobalBarrierManagerContext {
                 &command_ctx,
                 state.table_ids_to_commit,
                 state.resps,
-                backfill_progress,
+                backfill_pinned_log_epoch,
             )
             .await;
 
@@ -1228,7 +1220,7 @@ impl GlobalBarrierManagerContext {
         command_ctx: &CommandContext,
         tables_to_commit: HashSet<TableId>,
         resps: Vec<BarrierCompleteResponse>,
-        backfill_progress: HashMap<TableId, (u64, HashSet<TableId>)>,
+        backfill_pinned_log_epoch: HashMap<TableId, (u64, HashSet<TableId>)>,
     ) -> MetaResult<Option<HummockVersionStats>> {
         {
             {
@@ -1247,7 +1239,7 @@ impl GlobalBarrierManagerContext {
                             resps,
                             command_ctx,
                             epochs,
-                            backfill_progress,
+                            backfill_pinned_log_epoch,
                             tables_to_commit,
                         );
                         new_snapshot = self.hummock_manager.commit_epoch(commit_info).await?;
@@ -1348,22 +1340,26 @@ struct BarrierCompleteOutput {
 
 impl CheckpointControl {
     /// return creating job table fragment id -> (backfill progress epoch , {`upstream_mv_table_id`})
-    fn collect_backfill_progress(&self) -> HashMap<TableId, (u64, HashSet<TableId>)> {
+    fn collect_backfill_pinned_upstream_log_epoch(
+        &self,
+    ) -> HashMap<TableId, (u64, HashSet<TableId>)> {
         self.creating_streaming_job_controls
             .iter()
             .filter_map(|(table_id, creating_job)| {
-                creating_job.backfill_progress().map(|progress_epoch| {
-                    (
-                        *table_id,
+                creating_job
+                    .pinned_upstream_log_epoch()
+                    .map(|progress_epoch| {
                         (
-                            progress_epoch,
-                            creating_job
-                                .snapshot_backfill_info
-                                .upstream_mv_table_ids
-                                .clone(),
-                        ),
-                    )
-                })
+                            *table_id,
+                            (
+                                progress_epoch,
+                                creating_job
+                                    .snapshot_backfill_info
+                                    .upstream_mv_table_ids
+                                    .clone(),
+                            ),
+                        )
+                    })
             })
             .collect()
     }
@@ -1387,7 +1383,7 @@ impl CheckpointControl {
                 let join_handle = tokio::spawn(self.context.clone().complete_barrier(
                     node,
                     finished_jobs,
-                    self.collect_backfill_progress(),
+                    self.collect_backfill_pinned_upstream_log_epoch(),
                 ));
                 let require_next_checkpoint =
                     if self.create_mview_tracker.has_pending_finished_jobs() {
@@ -1677,7 +1673,7 @@ fn collect_commit_epoch_info(
     resps: Vec<BarrierCompleteResponse>,
     command_ctx: &CommandContext,
     epochs: &Vec<u64>,
-    backfill_progress: HashMap<TableId, (u64, HashSet<TableId>)>,
+    backfill_pinned_log_epoch: HashMap<TableId, (u64, HashSet<TableId>)>,
     tables_to_commit: HashSet<TableId>,
 ) -> CommitEpochInfo {
     let (sst_to_context, synced_ssts, new_table_watermarks, old_value_ssts) =
@@ -1724,7 +1720,7 @@ fn collect_commit_epoch_info(
             update_truncate_epoch(*mv_table_id, truncate_epoch);
         }
     }
-    for (_, (backfill_epoch, upstream_mv_table_ids)) in backfill_progress {
+    for (_, (backfill_epoch, upstream_mv_table_ids)) in backfill_pinned_log_epoch {
         for mv_table_id in upstream_mv_table_ids {
             update_truncate_epoch(mv_table_id, backfill_epoch);
         }
