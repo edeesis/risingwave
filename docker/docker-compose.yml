@@ -98,6 +98,17 @@ services:
       timeout: 5s
       retries: 5
     restart: always
+    command:
+      - 'postgres'
+      - '-c'
+      - 'wal_level=logical'
+
+  elasticsearch:
+    image: elastic/elasticsearch:7.8.0
+    ports:
+      - '9200:9200'
+    environment:
+      - discovery.type=single-node
 
   grafana-0:
     image: "grafana/grafana-oss:latest"
